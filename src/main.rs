@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use searxh::config::{Config, ExclusionRules, ResolvedPaths, expand_tilde};
-use searxh::index::{now_secs, publish_index, read_index, spawn_background_refresh};
+use searxh::index::{IndexSnapshot, now_secs, publish_index, spawn_background_refresh};
 use searxh::inspect::{InspectOptions, inspect_path};
 use searxh::scanner::{ScanOptions, scan_roots};
-use searxh::search::{QueryOptions, QueryOutputItem, TypeFilter, search};
+use searxh::search::{QueryOptions, QueryOutputItem, TypeFilter, search, search_snapshot};
 use searxh::state::StateStore;
 use searxh::watch::run_watch;
 use serde::Serialize;
@@ -261,25 +261,33 @@ fn run() -> Result<()> {
             let query_str = query.join(" ");
 
             let expected_fp = cfg.index_fingerprint(home_ref);
-            let entries = if live || !roots.is_empty() {
+            let q_opts = QueryOptions {
+                limit,
+                with_stat: stat,
+                type_filter: entry_type.into(),
+                now,
+            };
+
+            let items = if live || !roots.is_empty() {
                 let live_roots = if roots.is_empty() {
                     cfg.resolved_roots(home_ref)
                 } else {
                     roots.iter().map(|r| expand_tilde(r, home_ref)).collect()
                 };
                 let rules = ExclusionRules::from_config(&cfg);
-                scan_roots(&live_roots, &rules, &ScanOptions::default()).entries
+                let live_entries = scan_roots(&live_roots, &rules, &ScanOptions::default()).entries;
+                search(&live_entries, &state, &cfg, home_ref, &query_str, &q_opts)
             } else {
                 let cached = if paths.cache_path.exists() {
-                    read_index(&paths.cache_path).ok()
+                    IndexSnapshot::open(&paths.cache_path).ok()
                 } else {
                     None
                 };
 
                 match cached {
-                    Some(idx) if idx.config_fingerprint == expected_fp => {
+                    Some(snap) if snap.config_fingerprint == expected_fp => {
                         if !no_refresh
-                            && searxh::index::is_stale(idx.built_at, cfg.index_ttl_sec, now)
+                            && searxh::index::is_stale(snap.built_at, cfg.index_ttl_sec, now)
                         {
                             let _ = spawn_background_refresh(
                                 &paths.config_path,
@@ -287,7 +295,7 @@ fn run() -> Result<()> {
                                 &paths.state_path,
                             );
                         }
-                        idx.entries
+                        search_snapshot(&snap, &state, &cfg, home_ref, &query_str, &q_opts)
                     }
                     _ => {
                         let rules = ExclusionRules::from_config(&cfg);
@@ -297,24 +305,10 @@ fn run() -> Result<()> {
                             &ScanOptions::default(),
                         );
                         let _ = publish_index(&paths.cache_path, now, expected_fp, &res.entries);
-                        res.entries
+                        search(&res.entries, &state, &cfg, home_ref, &query_str, &q_opts)
                     }
                 }
             };
-
-            let items = search(
-                &entries,
-                &state,
-                &cfg,
-                home_ref,
-                &query_str,
-                &QueryOptions {
-                    limit,
-                    with_stat: stat,
-                    type_filter: entry_type.into(),
-                    now,
-                },
-            );
 
             let stdout = io::stdout();
             let mut out = stdout.lock();

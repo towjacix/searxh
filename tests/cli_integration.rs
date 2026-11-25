@@ -1,11 +1,11 @@
 use searxh::config::{Config, ExclusionRules, SortMode, VirtualFolderConfig};
 use searxh::index::{
-    EntryKind, IndexEntry, WatcherLock, is_watcher_active, publish_index, read_index,
-    read_index_header, write_index_atomic,
+    EntryKind, IndexEntry, IndexSnapshot, WatcherLock, is_watcher_active, publish_index,
+    read_index, read_index_header, write_index_atomic,
 };
 use searxh::inspect::{InspectOptions, inspect_path};
 use searxh::scanner::{ScanOptions, scan_roots};
-use searxh::search::{QueryOptions, QueryOutputItem, TypeFilter, search};
+use searxh::search::{QueryOptions, QueryOutputItem, TypeFilter, search, search_snapshot};
 use searxh::state::StateStore;
 use std::fs;
 use std::path::Path;
@@ -642,4 +642,111 @@ fn v02_config_fingerprint_invalidation_cold_readiness_and_missing_stat_filter() 
     assert_eq!(inv_items.len(), 1);
     assert_eq!(inv_items[0]["name"], "beta.txt");
     assert_eq!(read_index_header(&cache_path).unwrap().generation, 2);
+}
+
+#[test]
+fn v03_snapshot_zero_alloc_roundtrip_and_query_parity() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let cache_path = tmp.path().join("index_v3.bin");
+    let now = 1_700_000_000;
+
+    let entries = vec![
+        IndexEntry {
+            path: home
+                .join("Documents/specs.md")
+                .to_string_lossy()
+                .into_owned(),
+            kind: EntryKind::File,
+            size: 120,
+            mtime: now - 10,
+        },
+        IndexEntry {
+            path: home.join("Screenshots").to_string_lossy().into_owned(),
+            kind: EntryKind::Dir,
+            size: 4096,
+            mtime: now - 5,
+        },
+        IndexEntry {
+            path: home
+                .join("Screenshots/cap.png")
+                .to_string_lossy()
+                .into_owned(),
+            kind: EntryKind::File,
+            size: 2048,
+            mtime: now - 1,
+        },
+    ];
+
+    let cfg = Config::default();
+    let state = StateStore::default();
+    let opts = QueryOptions {
+        limit: 10,
+        with_stat: false,
+        type_filter: TypeFilter::All,
+        now,
+    };
+
+    publish_index(&cache_path, now, 777, &entries).unwrap();
+    let snap = IndexSnapshot::open(&cache_path).unwrap();
+    assert_eq!(snap.len(), 3);
+    assert_eq!(snap.get(2).basename, "cap.png");
+
+    let owned_res = search(&entries, &state, &cfg, Some(home), "cap", &opts);
+    let snap_res = search_snapshot(&snap, &state, &cfg, Some(home), "cap", &opts);
+    assert_eq!(
+        serde_json::to_value(&owned_res).unwrap(),
+        serde_json::to_value(&snap_res).unwrap()
+    );
+}
+
+#[test]
+fn v03_two_tier_ranking_protects_exact_match_over_heavy_frecency() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let now = 1_700_000_000;
+
+    let exact_path = home.join("misc/roadmap.md").to_string_lossy().into_owned();
+    let fuzzy_hot_path = home
+        .join("Documents/archived_roadmap_notes_v1.md")
+        .to_string_lossy()
+        .into_owned();
+
+    let entries = vec![
+        IndexEntry {
+            path: fuzzy_hot_path.clone(),
+            kind: EntryKind::File,
+            size: 500,
+            mtime: now - 10,
+        },
+        IndexEntry {
+            path: exact_path.clone(),
+            kind: EntryKind::File,
+            size: 100,
+            mtime: now - 500_000,
+        },
+    ];
+
+    let cfg = Config::default();
+    let mut state = StateStore::default();
+    state.pin(&fuzzy_hot_path);
+    for _ in 0..20 {
+        state.touch(&fuzzy_hot_path, now);
+    }
+
+    let opts = QueryOptions {
+        limit: 10,
+        with_stat: false,
+        type_filter: TypeFilter::All,
+        now,
+    };
+    let res = search(&entries, &state, &cfg, Some(home), "roadmap.md", &opts);
+    let paths: Vec<String> = res
+        .into_iter()
+        .filter_map(|x| match x {
+            QueryOutputItem::Entry(e) => Some(e.path),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(paths, vec![exact_path, fuzzy_hot_path]);
 }
