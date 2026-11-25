@@ -1,0 +1,17 @@
+[tools]
+rust = { version = "1.100.0", profile = "minimal", components = "clippy,rustfmt,rust-analyzer" }
+
+[tasks.build]
+description = "Build release binary"
+run = "cargo build --release --locked"
+
+[tasks.test]
+description = "Run unit and integration tests"
+run = "cargo test --locked"
+
+[tasks.lint]
+description = "Format check and clippy"
+run = """
+cargo fmt --check
+cargo clippy --all-targets --locked -- -D warnings
+"""

@@ -1,0 +1,15 @@
+[Unit]
+Description=searxh — incremental file index watcher
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/searxh watch
+Restart=on-failure
+RestartSec=3
+Nice=10
+IOSchedulingClass=idle
+MemoryMax=64M
+
+[Install]
+WantedBy=default.target

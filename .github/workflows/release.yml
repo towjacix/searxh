@@ -1,0 +1,70 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release-linux-x86_64:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jdx/mise-action@v2
+
+      - name: Install packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends zstd
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Verify minimal dynamic library linkage
+        run: |
+          ldd target/release/searxh
+          if ldd target/release/searxh | grep -qEv 'linux-vdso|libgcc_s|libm\.so|libc\.so|ld-linux'; then
+            echo "ERROR: release binary linked unexpected shared libraries"
+            exit 1
+          fi
+
+      - name: Package release archives and SHA256SUMS
+        run: |
+          TAG="${GITHUB_REF_NAME:-dev}"
+          TARGET="x86_64-unknown-linux-gnu"
+          STAGE="dist/stage"
+          ARCHIVE_GZ="searxh-${TAG}-${TARGET}.tar.gz"
+          ARCHIVE_ZST="searxh-${TAG}-${TARGET}.tar.zst"
+          mkdir -p "${STAGE}/bin" "${STAGE}/share/systemd/user"
+          cp target/release/searxh "${STAGE}/bin/searxh"
+          chmod 0755 "${STAGE}/bin/searxh"
+          cp contrib/searxh.service "${STAGE}/share/systemd/user/searxh.service"
+          cp README.md LICENSE "${STAGE}/"
+          mkdir -p dist/out
+          tar -C "${STAGE}" -czf "dist/out/${ARCHIVE_GZ}" .
+          tar -C "${STAGE}" --zstd -cf "dist/out/${ARCHIVE_ZST}" .
+          (cd dist/out && sha256sum "${ARCHIVE_GZ}" "${ARCHIVE_ZST}" > SHA256SUMS)
+          ls -lh dist/out
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/out/*.tar.gz
+            dist/out/*.tar.zst
+            dist/out/SHA256SUMS
+          generate_release_notes: true
