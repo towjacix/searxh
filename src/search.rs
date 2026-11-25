@@ -414,13 +414,13 @@ fn rank_empty_query(
             .then_with(|| b.1.cmp(&a.1))
             .then_with(|| a.2.path.cmp(&b.2.path))
     });
-    ranked.truncate(opts.limit);
 
     ranked
         .into_iter()
-        .map(|(score, _, entry, frec, pinned)| {
+        .filter_map(|(score, _, entry, frec, pinned)| {
             finalize_item(entry, score, pinned, frec, opts.with_stat)
         })
+        .take(opts.limit)
         .collect()
 }
 
@@ -462,12 +462,12 @@ fn rank_virtual_unfiltered(
                 .then_with(|| a.2.path.cmp(&b.2.path))
         }),
     }
-    scored.truncate(opts.limit);
     scored
         .into_iter()
-        .map(|(score, _, entry, frec, pinned)| {
+        .filter_map(|(score, _, entry, frec, pinned)| {
             finalize_item(entry.clone(), score, pinned, frec, opts.with_stat)
         })
+        .take(opts.limit)
         .collect()
 }
 
@@ -538,13 +538,13 @@ fn rank_fuzzy<'a>(
             .then_with(|| a.2.path.len().cmp(&b.2.path.len()))
             .then_with(|| a.2.path.cmp(&b.2.path))
     });
-    scored.truncate(opts.limit);
 
     scored
         .into_iter()
-        .map(|(score, _, entry, frec, pinned)| {
+        .filter_map(|(score, _, entry, frec, pinned)| {
             finalize_item(entry.clone(), score, pinned, frec, opts.with_stat)
         })
+        .take(opts.limit)
         .collect()
 }
 
@@ -597,9 +597,10 @@ fn finalize_item(
     pinned: bool,
     frecency: f64,
     with_stat: bool,
-) -> SearchResultItem {
+) -> Option<SearchResultItem> {
     let mut mode_str = None;
-    if with_stat && let Ok(meta) = std::fs::symlink_metadata(&entry.path) {
+    if with_stat {
+        let meta = std::fs::symlink_metadata(&entry.path).ok()?;
         let ft = meta.file_type();
         entry.kind = if ft.is_dir() {
             EntryKind::Dir
@@ -615,7 +616,7 @@ fn finalize_item(
 
     let name = basename(&entry.path).to_string();
     let category = file_category(&entry.path, entry.kind == EntryKind::Dir);
-    SearchResultItem {
+    Some(SearchResultItem {
         path: entry.path,
         name,
         kind: entry.kind.as_str(),
@@ -626,7 +627,7 @@ fn finalize_item(
         score,
         pinned,
         frecency,
-    }
+    })
 }
 
 pub fn format_unix_mode(mode: u32, kind: EntryKind) -> String {

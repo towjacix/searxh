@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use searxh::config::{Config, ExclusionRules, ResolvedPaths, expand_tilde};
-use searxh::index::{now_secs, read_index, spawn_background_refresh, write_index_atomic};
+use searxh::index::{now_secs, publish_index, read_index, spawn_background_refresh};
 use searxh::inspect::{InspectOptions, inspect_path};
 use searxh::scanner::{ScanOptions, scan_roots};
 use searxh::search::{QueryOptions, QueryOutputItem, TypeFilter, search};
@@ -161,6 +161,7 @@ struct IndexSummary {
     cache_path: String,
     entries: usize,
     watched_dirs: usize,
+    generation: u64,
     elapsed_ms: u128,
 }
 
@@ -217,13 +218,19 @@ fn run() -> Result<()> {
                     ..Default::default()
                 },
             );
-            write_index_atomic(&paths.cache_path, now_secs(), &res.entries)?;
+            let fp = if roots.is_empty() {
+                cfg.index_fingerprint(home_ref)
+            } else {
+                0
+            };
+            let generation = publish_index(&paths.cache_path, now_secs(), fp, &res.entries)?;
 
             if json {
                 let summary = IndexSummary {
                     cache_path: paths.cache_path.to_string_lossy().into_owned(),
                     entries: res.entries.len(),
                     watched_dirs: res.watched_dirs.len(),
+                    generation,
                     elapsed_ms: started.elapsed().as_millis(),
                 };
                 println!("{}", serde_json::to_string_pretty(&summary)?);
@@ -253,6 +260,7 @@ fn run() -> Result<()> {
             let state = StateStore::load(&paths.state_path);
             let query_str = query.join(" ");
 
+            let expected_fp = cfg.index_fingerprint(home_ref);
             let entries = if live || !roots.is_empty() {
                 let live_roots = if roots.is_empty() {
                     cfg.resolved_roots(home_ref)
@@ -261,9 +269,15 @@ fn run() -> Result<()> {
                 };
                 let rules = ExclusionRules::from_config(&cfg);
                 scan_roots(&live_roots, &rules, &ScanOptions::default()).entries
-            } else if paths.cache_path.exists() {
-                match read_index(&paths.cache_path) {
-                    Ok(idx) => {
+            } else {
+                let cached = if paths.cache_path.exists() {
+                    read_index(&paths.cache_path).ok()
+                } else {
+                    None
+                };
+
+                match cached {
+                    Some(idx) if idx.config_fingerprint == expected_fp => {
                         if !no_refresh
                             && searxh::index::is_stale(idx.built_at, cfg.index_ttl_sec, now)
                         {
@@ -275,26 +289,17 @@ fn run() -> Result<()> {
                         }
                         idx.entries
                     }
-                    Err(_) => {
+                    _ => {
                         let rules = ExclusionRules::from_config(&cfg);
                         let res = scan_roots(
                             &cfg.resolved_roots(home_ref),
                             &rules,
                             &ScanOptions::default(),
                         );
-                        let _ = write_index_atomic(&paths.cache_path, now, &res.entries);
+                        let _ = publish_index(&paths.cache_path, now, expected_fp, &res.entries);
                         res.entries
                     }
                 }
-            } else {
-                let rules = ExclusionRules::from_config(&cfg);
-                let res = scan_roots(
-                    &cfg.resolved_roots(home_ref),
-                    &rules,
-                    &ScanOptions::default(),
-                );
-                let _ = write_index_atomic(&paths.cache_path, now, &res.entries);
-                res.entries
             };
 
             let items = search(
@@ -375,24 +380,27 @@ fn run() -> Result<()> {
 
         Commands::Touch { path } => {
             let abs = canonicalize_or_abs(&path);
-            let mut state = StateStore::load(&paths.state_path);
-            let score = state.touch(&abs.to_string_lossy(), now_secs());
-            state.save_atomic(&paths.state_path)?;
+            let abs_str = abs.to_string_lossy().into_owned();
+            let now = now_secs();
+            let score =
+                StateStore::update_locked(&paths.state_path, |state| state.touch(&abs_str, now))?;
             writeln!(io::stdout().lock(), "{:.3}", score)?;
         }
 
         Commands::Pin { path } => {
             let abs = canonicalize_or_abs(&path);
-            let mut state = StateStore::load(&paths.state_path);
-            state.pin(&abs.to_string_lossy());
-            state.save_atomic(&paths.state_path)?;
+            let abs_str = abs.to_string_lossy().into_owned();
+            StateStore::update_locked(&paths.state_path, |state| {
+                state.pin(&abs_str);
+            })?;
         }
 
         Commands::Unpin { path } => {
             let abs = canonicalize_or_abs(&path);
-            let mut state = StateStore::load(&paths.state_path);
-            state.unpin(&abs.to_string_lossy());
-            state.save_atomic(&paths.state_path)?;
+            let abs_str = abs.to_string_lossy().into_owned();
+            StateStore::update_locked(&paths.state_path, |state| {
+                state.unpin(&abs_str);
+            })?;
         }
 
         Commands::Pins { json } => {

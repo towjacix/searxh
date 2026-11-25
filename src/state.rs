@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const HALF_LIFE_SECS: f64 = 7.0 * 86_400.0;
 const MAX_FRECENCY_RECORDS: usize = 5000;
@@ -22,6 +22,37 @@ pub struct StateStore {
 }
 
 impl StateStore {
+    pub fn update_locked<F, R>(path: &Path, mutate: F) -> Result<R>
+    where
+        F: FnOnce(&mut Self) -> R,
+    {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create state dir {}", parent.display()))?;
+
+        let mut lock_os = path.as_os_str().to_os_string();
+        lock_os.push(".lock");
+        let lock_path = PathBuf::from(lock_os);
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| format!("open state lock {}", lock_path.display()))?;
+        lock_file
+            .lock()
+            .with_context(|| format!("acquire state lock {}", lock_path.display()))?;
+
+        let mut state = Self::load(path);
+        let out = mutate(&mut state);
+        state.save_atomic(path)?;
+        Ok(out)
+    }
+
     pub fn load(path: &Path) -> Self {
         let Ok(file) = File::open(path) else {
             return Self::default();

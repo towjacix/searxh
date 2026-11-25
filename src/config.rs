@@ -366,6 +366,57 @@ impl Config {
         }
         merged
     }
+
+    /// Deterministic FNV-1a 64-bit fingerprint over config knobs that affect the
+    /// indexed entry set (`roots`, `exclude_names`, `exclude_paths`, `include_hidden`).
+    /// Ranking-only fields (priority_roots, virtuals, TTL, debounce) are excluded
+    /// so tweaking sort/UI settings never invalidates the binary index.
+    pub fn index_fingerprint(&self, home_dir: Option<&Path>) -> u64 {
+        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x0100_0000_01b3;
+
+        #[inline]
+        fn mix_bytes(h: &mut u64, bytes: &[u8]) {
+            for &b in bytes {
+                *h ^= u64::from(b);
+                *h = h.wrapping_mul(FNV_PRIME);
+            }
+            *h ^= 0xff;
+            *h = h.wrapping_mul(FNV_PRIME);
+        }
+
+        let mut h = FNV_OFFSET;
+        mix_bytes(&mut h, b"roots");
+        for root in self.resolved_roots(home_dir) {
+            let canon = fs::canonicalize(&root).unwrap_or(root);
+            mix_bytes(&mut h, canon.to_string_lossy().as_bytes());
+        }
+
+        mix_bytes(&mut h, b"exclude_names");
+        let mut names: Vec<&str> = self.exclude_names.iter().map(|s| s.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        for name in names {
+            mix_bytes(&mut h, name.as_bytes());
+        }
+
+        mix_bytes(&mut h, b"exclude_paths");
+        let mut paths: Vec<&str> = self
+            .exclude_paths
+            .iter()
+            .map(|s| s.trim_matches('/'))
+            .filter(|s| !s.is_empty())
+            .collect();
+        paths.sort_unstable();
+        paths.dedup();
+        for p in paths {
+            mix_bytes(&mut h, p.as_bytes());
+        }
+
+        mix_bytes(&mut h, b"include_hidden");
+        mix_bytes(&mut h, &[u8::from(self.include_hidden)]);
+        h
+    }
 }
 
 #[derive(Debug, Clone)]

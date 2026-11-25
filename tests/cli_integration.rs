@@ -1,5 +1,8 @@
 use searxh::config::{Config, ExclusionRules, SortMode, VirtualFolderConfig};
-use searxh::index::{EntryKind, IndexEntry, read_index, write_index_atomic};
+use searxh::index::{
+    EntryKind, IndexEntry, WatcherLock, is_watcher_active, publish_index, read_index,
+    read_index_header, write_index_atomic,
+};
 use searxh::inspect::{InspectOptions, inspect_path};
 use searxh::scanner::{ScanOptions, scan_roots};
 use searxh::search::{QueryOptions, QueryOutputItem, TypeFilter, search};
@@ -7,6 +10,8 @@ use searxh::state::StateStore;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
+use std::thread;
 use tempfile::TempDir;
 
 fn write_file(path: &Path, bytes: &[u8]) {
@@ -481,4 +486,160 @@ fn cli_end_to_end_index_query_touch_pin_inspect() {
     let ins_json: serde_json::Value = serde_json::from_slice(&inspect_out.stdout).unwrap();
     assert_eq!(ins_json["preview_kind"], "text");
     assert_eq!(ins_json["text"], "# Roadmap");
+}
+
+#[test]
+fn v02_single_writer_generation_and_watcher_lock() {
+    let tmp = TempDir::new().unwrap();
+    let idx_path = Arc::new(tmp.path().join("cache/index.bin"));
+
+    let mut handles = Vec::new();
+    for worker in 0..8u64 {
+        let path = Arc::clone(&idx_path);
+        handles.push(thread::spawn(move || {
+            let entry = vec![IndexEntry {
+                path: format!("/tmp/file_{worker}.txt"),
+                kind: EntryKind::File,
+                size: worker,
+                mtime: 1_700_000_000 + worker,
+            }];
+            publish_index(&path, 1_700_000_000 + worker, 42, &entry).unwrap()
+        }));
+    }
+
+    let mut gens: Vec<u64> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    gens.sort_unstable();
+    assert_eq!(gens, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+
+    let hdr = read_index_header(&idx_path).unwrap();
+    assert_eq!(hdr.generation, 8);
+    assert_eq!(hdr.config_fingerprint, 42);
+    let loaded = read_index(&idx_path).unwrap();
+    assert_eq!(loaded.entries.len(), 1);
+
+    // Watcher lock exclusivity
+    assert!(!is_watcher_active(&idx_path));
+    let guard = WatcherLock::try_acquire(&idx_path).unwrap().unwrap();
+    assert!(is_watcher_active(&idx_path));
+    assert!(WatcherLock::try_acquire(&idx_path).unwrap().is_none());
+    drop(guard);
+    assert!(!is_watcher_active(&idx_path));
+    assert!(WatcherLock::try_acquire(&idx_path).unwrap().is_some());
+}
+
+#[test]
+fn v02_concurrent_state_mutations_preserve_all_updates() {
+    let tmp = TempDir::new().unwrap();
+    let state_path = Arc::new(tmp.path().join("state.json"));
+
+    let mut handles = Vec::new();
+    for i in 0..16 {
+        let p = Arc::clone(&state_path);
+        handles.push(thread::spawn(move || {
+            let target = format!("/home/u/doc_{i}.md");
+            StateStore::update_locked(&p, |s| {
+                s.touch(&target, 1_700_000_000);
+                s.pin(&target);
+            })
+            .unwrap();
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let final_state = StateStore::load(&state_path);
+    assert_eq!(final_state.pinned.len(), 16);
+    assert_eq!(final_state.frecency.len(), 16);
+}
+
+#[test]
+fn v02_config_fingerprint_invalidation_cold_readiness_and_missing_stat_filter() {
+    let tmp = TempDir::new().unwrap();
+    let root_a = tmp.path().join("root_a");
+    let root_b = tmp.path().join("root_b");
+    let cfg_path = tmp.path().join("config.toml");
+    let cache_path = tmp.path().join("index.bin");
+    let state_path = tmp.path().join("state.json");
+
+    write_file(&root_a.join("alpha.txt"), b"a1");
+    write_file(&root_a.join("alpha_alive.txt"), b"a2");
+    write_file(&root_b.join("beta.txt"), b"b1");
+
+    // 1. Fingerprint sensitivity check
+    let mut cfg1 = Config {
+        roots: vec![root_a.to_string_lossy().into_owned()],
+        ..Default::default()
+    };
+    let fp1 = cfg1.index_fingerprint(None);
+    cfg1.index_ttl_sec = 9999; // ranking/lifecycle-only change must NOT invalidate
+    cfg1.priority_roots.push("~/Extra".to_string());
+    assert_eq!(cfg1.index_fingerprint(None), fp1);
+    cfg1.exclude_names.push("secret_noise".to_string());
+    assert_ne!(cfg1.index_fingerprint(None), fp1);
+
+    // 2. Cold query with missing index.bin automatically builds V2 index
+    write_file(
+        &cfg_path,
+        format!("roots = [{:?}]\n", root_a.to_string_lossy()).as_bytes(),
+    );
+    let bin = env!("CARGO_BIN_EXE_searxh");
+    let base_args = [
+        "--config",
+        cfg_path.to_str().unwrap(),
+        "--cache",
+        cache_path.to_str().unwrap(),
+        "--state",
+        state_path.to_str().unwrap(),
+    ];
+
+    let cold_out = Command::new(bin)
+        .args(base_args)
+        .args(["query", "--json", "--stat", "--no-refresh", "--", "alpha"])
+        .output()
+        .unwrap();
+    assert!(cold_out.status.success(), "{:?}", cold_out);
+    assert!(cache_path.exists());
+    let cold_arr: serde_json::Value = serde_json::from_slice(&cold_out.stdout).unwrap();
+    assert_eq!(cold_arr.as_array().unwrap().len(), 2);
+
+    // 3. Delete one file on disk without refreshing index.bin: `--stat` drops missing file
+    //    and still fills Top-K (`--limit 1`) with the remaining live file.
+    fs::remove_file(root_a.join("alpha.txt")).unwrap();
+    let stat_out = Command::new(bin)
+        .args(base_args)
+        .args([
+            "query",
+            "--json",
+            "--stat",
+            "--no-refresh",
+            "--limit",
+            "1",
+            "--",
+            "alpha",
+        ])
+        .output()
+        .unwrap();
+    assert!(stat_out.status.success());
+    let stat_arr: serde_json::Value = serde_json::from_slice(&stat_out.stdout).unwrap();
+    let arr = stat_arr.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["name"], "alpha_alive.txt");
+
+    // 4. Changing config roots invalidates stale index.bin automatically on next query
+    write_file(
+        &cfg_path,
+        format!("roots = [{:?}]\n", root_b.to_string_lossy()).as_bytes(),
+    );
+    let invalidated_out = Command::new(bin)
+        .args(base_args)
+        .args(["query", "--json", "--no-refresh", "--", "beta"])
+        .output()
+        .unwrap();
+    assert!(invalidated_out.status.success());
+    let inv_arr: serde_json::Value = serde_json::from_slice(&invalidated_out.stdout).unwrap();
+    let inv_items = inv_arr.as_array().unwrap();
+    assert_eq!(inv_items.len(), 1);
+    assert_eq!(inv_items[0]["name"], "beta.txt");
+    assert_eq!(read_index_header(&cache_path).unwrap().generation, 2);
 }
