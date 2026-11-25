@@ -38,6 +38,15 @@ pub struct DirEntryPreview {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct DirSummary {
+    pub total_entries: usize,
+    pub files: usize,
+    pub dirs: usize,
+    pub symlinks: usize,
+    pub direct_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct GpsCoords {
     pub lat: f64,
     pub lon: f64,
@@ -80,7 +89,13 @@ pub struct InspectResult {
     pub name: String,
     pub kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub symlink_target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symlink_broken: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_path: Option<String>,
     pub category: &'static str,
     pub size: u64,
     pub mtime: u64,
@@ -89,11 +104,15 @@ pub struct InspectResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub truncated: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lines: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_entries: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dir_summary: Option<DirSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entries: Option<Vec<DirEntryPreview>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -117,6 +136,19 @@ pub fn inspect_path(path: &Path, opts: &InspectOptions) -> Result<InspectResult>
     } else {
         None
     };
+    let symlink_broken = if is_symlink {
+        Some(target_meta.is_none())
+    } else {
+        None
+    };
+    let resolved_path = if is_symlink && target_meta.is_some() {
+        fs::canonicalize(path)
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+    } else {
+        None
+    };
+
     let effective_meta = target_meta.as_ref().unwrap_or(&lmeta);
     let is_dir = effective_meta.is_dir();
 
@@ -136,21 +168,26 @@ pub fn inspect_path(path: &Path, opts: &InspectOptions) -> Result<InspectResult>
     let mode = format_unix_mode(lmeta.permissions().mode(), kind);
 
     if is_dir {
-        let (entries, total_entries) = read_dir_preview(path, opts.max_entries)?;
+        let (entries, summary) = read_dir_preview(path, opts.max_entries)?;
         return Ok(InspectResult {
             path: path_str,
             name,
             kind: kind.as_str(),
+            mime: Some("inode/directory".to_string()),
             symlink_target,
+            symlink_broken,
+            resolved_path,
             category,
             size,
             mtime,
             mode,
             preview_kind: "dir",
             text: None,
+            encoding: None,
             truncated: None,
             lines: None,
-            total_entries: Some(total_entries),
+            total_entries: Some(summary.total_entries),
+            dir_summary: Some(summary),
             entries: Some(entries),
             image: None,
         });
@@ -162,39 +199,23 @@ pub fn inspect_path(path: &Path, opts: &InspectOptions) -> Result<InspectResult>
             path: path_str,
             name,
             kind: kind.as_str(),
+            mime: Some("inode/symlink".to_string()),
             symlink_target,
+            symlink_broken,
+            resolved_path,
             category,
             size,
             mtime,
             mode,
             preview_kind: "none",
             text: None,
+            encoding: None,
             truncated: None,
             lines: None,
             total_entries: None,
+            dir_summary: None,
             entries: None,
             image: None,
-        });
-    }
-
-    if category == "image" {
-        let image = inspect_image(path, opts.include_gps);
-        return Ok(InspectResult {
-            path: path_str,
-            name,
-            kind: kind.as_str(),
-            symlink_target,
-            category,
-            size,
-            mtime,
-            mode,
-            preview_kind: "image",
-            text: None,
-            truncated: None,
-            lines: None,
-            total_entries: None,
-            entries: None,
-            image,
         });
     }
 
@@ -204,21 +225,60 @@ pub fn inspect_path(path: &Path, opts: &InspectOptions) -> Result<InspectResult>
     file.take(read_cap as u64).read_to_end(&mut raw)?;
 
     let sniff_len = raw.len().min(8192);
-    if is_likely_binary(&raw[..sniff_len]) {
+    let sniff_slice = &raw[..sniff_len];
+    let detected_mime = sniff_mime(&path_str, sniff_slice);
+    let is_image_magic = detected_mime
+        .as_deref()
+        .is_some_and(|m| m.starts_with("image/"));
+
+    if category == "image" || is_image_magic {
+        let image = inspect_image(path, opts.include_gps);
+        if image.is_some() || category == "image" {
+            return Ok(InspectResult {
+                path: path_str,
+                name,
+                kind: kind.as_str(),
+                mime: detected_mime.or_else(|| Some("image/unknown".to_string())),
+                symlink_target,
+                symlink_broken,
+                resolved_path,
+                category: if is_image_magic { "image" } else { category },
+                size,
+                mtime,
+                mode,
+                preview_kind: "image",
+                text: None,
+                encoding: None,
+                truncated: None,
+                lines: None,
+                total_entries: None,
+                dir_summary: None,
+                entries: None,
+                image,
+            });
+        }
+    }
+
+    if is_likely_binary(sniff_slice) {
         return Ok(InspectResult {
             path: path_str,
             name,
             kind: kind.as_str(),
+            mime: detected_mime.or_else(|| Some("application/octet-stream".to_string())),
             symlink_target,
+            symlink_broken,
+            resolved_path,
             category,
             size,
             mtime,
             mode,
             preview_kind: "binary",
             text: None,
+            encoding: None,
             truncated: None,
             lines: None,
             total_entries: None,
+            dir_summary: None,
             entries: None,
             image: None,
         });
@@ -231,30 +291,179 @@ pub fn inspect_path(path: &Path, opts: &InspectOptions) -> Result<InspectResult>
         &raw[..]
     };
 
-    let safe_str = decode_utf8_prefix_safe(slice);
+    let (safe_str, encoding) = decode_utf8_prefix_safe(slice);
     let (text, line_count, hit_line_cap) = truncate_lines(&safe_str, opts.max_lines);
+    let text_mime = detected_mime.unwrap_or_else(|| text_mime_for_path(&path_str, sniff_slice));
 
     Ok(InspectResult {
         path: path_str,
         name,
         kind: kind.as_str(),
+        mime: Some(text_mime),
         symlink_target,
+        symlink_broken,
+        resolved_path,
         category,
         size,
         mtime,
         mode,
         preview_kind: "text",
         text: Some(text),
+        encoding: Some(encoding),
         truncated: Some(hit_byte_cap || hit_line_cap),
         lines: Some(line_count),
         total_entries: None,
+        dir_summary: None,
         entries: None,
         image: None,
     })
 }
 
-fn read_dir_preview(path: &Path, max_entries: usize) -> Result<(Vec<DirEntryPreview>, usize)> {
+fn sniff_mime(path: &str, head: &[u8]) -> Option<String> {
+    if head.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("image/png".to_string());
+    }
+    if head.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg".to_string());
+    }
+    if head.starts_with(b"GIF87a") || head.starts_with(b"GIF89a") {
+        return Some("image/gif".to_string());
+    }
+    if head.len() >= 12 && &head[0..4] == b"RIFF" && &head[8..12] == b"WEBP" {
+        return Some("image/webp".to_string());
+    }
+    if head.starts_with(b"BM") && head.len() >= 14 {
+        return Some("image/bmp".to_string());
+    }
+    if (head.starts_with(b"II*\0") || head.starts_with(b"MM\0*")) && head.len() >= 8 {
+        return Some("image/tiff".to_string());
+    }
+    if head.len() >= 12 && &head[4..8] == b"ftyp" {
+        let brand = &head[8..12];
+        if brand == b"avif" || brand == b"avis" {
+            return Some("image/avif".to_string());
+        }
+        if matches!(brand, b"heic" | b"heix" | b"mif1" | b"msf1") {
+            return Some("image/heic".to_string());
+        }
+        return Some("video/mp4".to_string());
+    }
+    if head.starts_with(&[0xFF, 0x0A]) || head.starts_with(b"\x00\x00\x00\x0CJXL ") {
+        return Some("image/jxl".to_string());
+    }
+    if head.starts_with(b"%PDF-") {
+        return Some("application/pdf".to_string());
+    }
+    if head.starts_with(b"\x7FELF") {
+        return Some("application/x-elf".to_string());
+    }
+    if head.starts_with(b"SQLite format 3\0") {
+        return Some("application/vnd.sqlite3".to_string());
+    }
+    if head.starts_with(b"PK\x03\x04") || head.starts_with(b"PK\x05\x06") {
+        let ext = Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        return Some(match ext.as_deref() {
+            Some("docx") => {
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                    .to_string()
+            }
+            Some("xlsx") => {
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".to_string()
+            }
+            Some("pptx") => {
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                    .to_string()
+            }
+            _ => "application/zip".to_string(),
+        });
+    }
+    if head.starts_with(&[0x1F, 0x8B]) {
+        return Some("application/gzip".to_string());
+    }
+    if head.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+        return Some("application/zstd".to_string());
+    }
+    if head.starts_with(&[0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00]) {
+        return Some("application/x-xz".to_string());
+    }
+    if head.starts_with(&[0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C]) {
+        return Some("application/x-7z-compressed".to_string());
+    }
+    if head.starts_with(b"Rar!") {
+        return Some("application/vnd.rar".to_string());
+    }
+    if head.starts_with(b"fLaC") {
+        return Some("audio/flac".to_string());
+    }
+    if head.starts_with(b"OggS") {
+        return Some("audio/ogg".to_string());
+    }
+    if head.starts_with(b"ID3") || (head.len() >= 2 && head[0] == 0xFF && (head[1] & 0xE0) == 0xE0)
+    {
+        return Some("audio/mpeg".to_string());
+    }
+    if head.len() >= 12 && &head[0..4] == b"RIFF" && &head[8..12] == b"WAVE" {
+        return Some("audio/wav".to_string());
+    }
+    if head.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+        return Some("video/x-matroska".to_string());
+    }
+    // Check SVG XML text
+    if let Ok(s) = std::str::from_utf8(head) {
+        let trimmed = s.trim_start();
+        if trimmed.starts_with("<svg") || (trimmed.starts_with("<?xml") && trimmed.contains("<svg"))
+        {
+            return Some("image/svg+xml".to_string());
+        }
+    }
+    None
+}
+
+fn text_mime_for_path(path: &str, head: &[u8]) -> String {
+    if let Ok(s) = std::str::from_utf8(head)
+        && let Some(first_line) = s.lines().next()
+        && let Some(shebang) = first_line.strip_prefix("#!")
+    {
+        if shebang.contains("python") {
+            return "text/x-python".to_string();
+        }
+        if shebang.contains("sh") || shebang.contains("zsh") {
+            return "text/x-shellscript".to_string();
+        }
+    }
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("rs") => "text/x-rust".to_string(),
+        Some("qml") => "text/x-qml".to_string(),
+        Some("js" | "mjs" | "cjs") => "text/javascript".to_string(),
+        Some("ts") => "text/typescript".to_string(),
+        Some("py") => "text/x-python".to_string(),
+        Some("sh" | "bash" | "zsh") => "text/x-shellscript".to_string(),
+        Some("go") => "text/x-go".to_string(),
+        Some("json") => "application/json".to_string(),
+        Some("toml") => "application/toml".to_string(),
+        Some("yaml" | "yml") => "application/yaml".to_string(),
+        Some("md") => "text/markdown".to_string(),
+        Some("html" | "htm") => "text/html".to_string(),
+        Some("css") => "text/css".to_string(),
+        Some("csv") => "text/csv".to_string(),
+        _ => "text/plain".to_string(),
+    }
+}
+
+fn read_dir_preview(path: &Path, max_entries: usize) -> Result<(Vec<DirEntryPreview>, DirSummary)> {
     let mut all = Vec::new();
+    let mut files = 0usize;
+    let mut dirs = 0usize;
+    let mut symlinks = 0usize;
+    let mut direct_bytes = 0u64;
+
     let rd = fs::read_dir(path).with_context(|| format!("read_dir {}", path.display()))?;
     for entry_res in rd {
         let Ok(entry) = entry_res else { continue };
@@ -265,13 +474,19 @@ fn read_dir_preview(path: &Path, max_entries: usize) -> Result<(Vec<DirEntryPrev
         let is_dir = ft.is_some_and(|t| t.is_dir());
         let is_sym = ft.is_some_and(|t| t.is_symlink());
         let kind = if is_dir {
+            dirs += 1;
             "dir"
         } else if is_sym {
+            symlinks += 1;
             "symlink"
         } else {
+            files += 1;
             "file"
         };
         let size = meta.map(|m| m.len()).unwrap_or(0);
+        if !is_dir {
+            direct_bytes = direct_bytes.saturating_add(size);
+        }
         all.push((
             !is_dir,
             name.to_ascii_lowercase(),
@@ -283,14 +498,23 @@ fn read_dir_preview(path: &Path, max_entries: usize) -> Result<(Vec<DirEntryPrev
             },
         ));
     }
-    let total = all.len();
+    let total_entries = all.len();
     all.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     let preview = all
         .into_iter()
         .take(max_entries)
         .map(|(_, _, item)| item)
         .collect();
-    Ok((preview, total))
+    Ok((
+        preview,
+        DirSummary {
+            total_entries,
+            files,
+            dirs,
+            symlinks,
+            direct_bytes,
+        },
+    ))
 }
 
 fn is_likely_binary(sample: &[u8]) -> bool {
@@ -307,14 +531,17 @@ fn is_likely_binary(sample: &[u8]) -> bool {
     ctrl_count * 10 > sample.len()
 }
 
-fn decode_utf8_prefix_safe(slice: &[u8]) -> String {
+fn decode_utf8_prefix_safe(slice: &[u8]) -> (String, &'static str) {
     match std::str::from_utf8(slice) {
-        Ok(s) => s.to_string(),
+        Ok(s) => (s.to_string(), "utf-8"),
         Err(e) if e.error_len().is_none() => {
             // Cut neatly before incomplete trailing multi-byte char
-            String::from_utf8_lossy(&slice[..e.valid_up_to()]).into_owned()
+            (
+                String::from_utf8_lossy(&slice[..e.valid_up_to()]).into_owned(),
+                "utf-8",
+            )
         }
-        Err(_) => String::from_utf8_lossy(slice).into_owned(),
+        Err(_) => (String::from_utf8_lossy(slice).into_owned(), "utf-8-lossy"),
     }
 }
 

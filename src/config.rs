@@ -36,6 +36,9 @@ pub struct Config {
     pub include_hidden: bool,
     pub index_ttl_sec: u64,
     pub watch_debounce_ms: u64,
+    pub inspect_max_bytes: usize,
+    pub inspect_max_lines: usize,
+    pub inspect_max_entries: usize,
     pub virtuals: BTreeMap<String, VirtualFolderConfig>,
 }
 
@@ -56,6 +59,9 @@ impl Default for Config {
             include_hidden: true,
             index_ttl_sec: 180,
             watch_debounce_ms: 800,
+            inspect_max_bytes: 262_144,
+            inspect_max_lines: 2000,
+            inspect_max_entries: 40,
             virtuals: BTreeMap::new(),
         }
     }
@@ -285,6 +291,9 @@ struct RawConfigFile {
     include_hidden: Option<bool>,
     index_ttl_sec: Option<u64>,
     watch_debounce_ms: Option<u64>,
+    inspect_max_bytes: Option<usize>,
+    inspect_max_lines: Option<usize>,
+    inspect_max_entries: Option<usize>,
     #[serde(rename = "virtual")]
     virtual_table: Option<BTreeMap<String, VirtualFolderConfig>>,
     virtuals: Option<BTreeMap<String, VirtualFolderConfig>>,
@@ -318,6 +327,15 @@ impl Config {
         }
         if let Some(debounce) = raw.watch_debounce_ms {
             cfg.watch_debounce_ms = debounce;
+        }
+        if let Some(bytes) = raw.inspect_max_bytes {
+            cfg.inspect_max_bytes = bytes;
+        }
+        if let Some(lines) = raw.inspect_max_lines {
+            cfg.inspect_max_lines = lines;
+        }
+        if let Some(entries) = raw.inspect_max_entries {
+            cfg.inspect_max_entries = entries;
         }
         if let Some(vt) = raw.virtual_table {
             cfg.virtuals.extend(vt);

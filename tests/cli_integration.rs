@@ -750,3 +750,110 @@ fn v03_two_tier_ranking_protects_exact_match_over_heavy_frecency() {
         .collect();
     assert_eq!(paths, vec![exact_path, fuzzy_hot_path]);
 }
+
+#[test]
+fn v04_inspector_mime_symlink_dir_summary_and_versioned_envelopes() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("work");
+    let cfg_path = tmp.path().join("config.toml");
+    let cache_path = tmp.path().join("index.bin");
+    let state_path = tmp.path().join("state.json");
+
+    // 1. Extensionless PNG detected via magic bytes as image/png + preview_kind=image
+    let extless_png = root.join("mystery_avatar");
+    write_file(&extless_png, &minimal_png_32x16());
+    let png_ins = inspect_path(&extless_png, &InspectOptions::default()).unwrap();
+    assert_eq!(png_ins.mime.as_deref(), Some("image/png"));
+    assert_eq!(png_ins.preview_kind, "image");
+    assert_eq!(png_ins.category, "image");
+
+    // 2. Shell script shebang & PDF magic
+    let sh_file = root.join("deploy");
+    write_file(&sh_file, b"#!/usr/bin/env bash\necho ok\n");
+    let sh_ins = inspect_path(&sh_file, &InspectOptions::default()).unwrap();
+    assert_eq!(sh_ins.mime.as_deref(), Some("text/x-shellscript"));
+    assert_eq!(sh_ins.encoding, Some("utf-8"));
+
+    let pdf_file = root.join("doc.bin");
+    write_file(&pdf_file, b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n\x00");
+    let pdf_ins = inspect_path(&pdf_file, &InspectOptions::default()).unwrap();
+    assert_eq!(pdf_ins.mime.as_deref(), Some("application/pdf"));
+    assert_eq!(pdf_ins.preview_kind, "binary");
+
+    // 3. Live symlink vs broken symlink
+    let live_link = root.join("avatar_link");
+    symlink(&extless_png, &live_link).unwrap();
+    let live_ins = inspect_path(&live_link, &InspectOptions::default()).unwrap();
+    assert_eq!(live_ins.kind, "symlink");
+    assert_eq!(live_ins.symlink_broken, Some(false));
+    assert!(live_ins.symlink_target.is_some());
+    assert!(live_ins.resolved_path.is_some());
+    assert_eq!(live_ins.mime.as_deref(), Some("image/png"));
+
+    let dead_link = root.join("broken_link");
+    symlink(root.join("nonexistent_target"), &dead_link).unwrap();
+    let dead_ins = inspect_path(&dead_link, &InspectOptions::default()).unwrap();
+    assert_eq!(dead_ins.kind, "symlink");
+    assert_eq!(dead_ins.symlink_broken, Some(true));
+    assert_eq!(dead_ins.preview_kind, "none");
+    assert_eq!(dead_ins.mime.as_deref(), Some("inode/symlink"));
+
+    // 4. Directory summary
+    write_file(&root.join("sub_folder/a.txt"), b"hello");
+    let dir_ins = inspect_path(&root, &InspectOptions::default()).unwrap();
+    assert_eq!(dir_ins.mime.as_deref(), Some("inode/directory"));
+    let summary = dir_ins.dir_summary.unwrap();
+    assert!(summary.files >= 3);
+    assert!(summary.dirs >= 1);
+    assert!(summary.symlinks >= 2);
+    assert!(summary.direct_bytes > 0);
+
+    // 5. Configurable inspect_max_bytes via config.toml + versioned envelopes via CLI
+    let long_file = root.join("long_notes.txt");
+    write_file(&long_file, b"0123456789abcdefghijklmnopqrstuvwxyz");
+    write_file(
+        &cfg_path,
+        format!(
+            "roots = [{:?}]\ninspect_max_bytes = 10\n",
+            root.to_string_lossy()
+        )
+        .as_bytes(),
+    );
+
+    let bin = env!("CARGO_BIN_EXE_searxh");
+    let base_args = [
+        "--config",
+        cfg_path.to_str().unwrap(),
+        "--cache",
+        cache_path.to_str().unwrap(),
+        "--state",
+        state_path.to_str().unwrap(),
+    ];
+
+    let ins_out = Command::new(bin)
+        .args(base_args)
+        .args(["inspect", "--envelope", "--", long_file.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(ins_out.status.success(), "{:?}", ins_out);
+    let ins_env: serde_json::Value = serde_json::from_slice(&ins_out.stdout).unwrap();
+    assert_eq!(ins_env["schema_version"], 1);
+    assert_eq!(ins_env["tool"], "searxh");
+    assert_eq!(ins_env["command"], "inspect");
+    assert_eq!(ins_env["result"]["truncated"], true);
+    assert_eq!(ins_env["result"]["text"], "0123456789");
+
+    let q_out = Command::new(bin)
+        .args(base_args)
+        .args(["query", "--envelope", "--no-refresh", "--", "long_notes"])
+        .output()
+        .unwrap();
+    assert!(q_out.status.success(), "{:?}", q_out);
+    let q_env: serde_json::Value = serde_json::from_slice(&q_out.stdout).unwrap();
+    assert_eq!(q_env["schema_version"], 1);
+    assert_eq!(q_env["command"], "query");
+    assert!(q_env["index_generation"].as_u64().unwrap() >= 1);
+    assert_eq!(q_env["items"][0]["name"], "long_notes.txt");
+}

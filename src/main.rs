@@ -57,6 +57,10 @@ enum Commands {
         #[arg(long)]
         json: bool,
 
+        /// Output versioned schema-v1 JSON envelope (implies JSON)
+        #[arg(long)]
+        envelope: bool,
+
         /// Null-delimited path output (for xargs -0 / fzf --read0)
         #[arg(long)]
         print0: bool,
@@ -111,17 +115,21 @@ enum Commands {
         #[arg(long)]
         json: bool,
 
-        /// Max bytes to read for text previews
-        #[arg(long, default_value_t = 262_144)]
-        max_bytes: usize,
+        /// Output versioned schema-v1 JSON envelope (implies JSON)
+        #[arg(long)]
+        envelope: bool,
 
-        /// Max lines for text previews
-        #[arg(long, default_value_t = 2000)]
-        max_lines: usize,
+        /// Max bytes to read for text previews (defaults to config inspect_max_bytes)
+        #[arg(long)]
+        max_bytes: Option<usize>,
 
-        /// Max entries listed when path is a directory
-        #[arg(long, default_value_t = 40)]
-        max_entries: usize,
+        /// Max lines for text previews (defaults to config inspect_max_lines)
+        #[arg(long)]
+        max_lines: Option<usize>,
+
+        /// Max entries listed when path is a directory (defaults to config inspect_max_entries)
+        #[arg(long)]
+        max_entries: Option<usize>,
 
         /// Include raw GPS coordinates in EXIF output (hidden by default)
         #[arg(long)]
@@ -156,6 +164,8 @@ enum Commands {
     Watch,
 }
 
+const JSON_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Serialize)]
 struct IndexSummary {
     cache_path: String,
@@ -163,6 +173,27 @@ struct IndexSummary {
     watched_dirs: usize,
     generation: u64,
     elapsed_ms: u128,
+}
+
+#[derive(Serialize)]
+struct QueryEnvelope<'a> {
+    schema_version: u32,
+    tool: &'static str,
+    tool_version: &'static str,
+    command: &'static str,
+    index_generation: Option<u64>,
+    index_built_at: Option<u64>,
+    config_fingerprint: u64,
+    items: &'a [QueryOutputItem],
+}
+
+#[derive(Serialize)]
+struct InspectEnvelope<'a> {
+    schema_version: u32,
+    tool: &'static str,
+    tool_version: &'static str,
+    command: &'static str,
+    result: &'a searxh::inspect::InspectResult,
 }
 
 fn canonicalize_or_abs(path: &Path) -> PathBuf {
@@ -247,6 +278,7 @@ fn run() -> Result<()> {
 
         Commands::Query {
             json,
+            envelope,
             print0,
             limit,
             stat,
@@ -268,7 +300,7 @@ fn run() -> Result<()> {
                 now,
             };
 
-            let items = if live || !roots.is_empty() {
+            let (index_generation, index_built_at, items) = if live || !roots.is_empty() {
                 let live_roots = if roots.is_empty() {
                     cfg.resolved_roots(home_ref)
                 } else {
@@ -276,7 +308,11 @@ fn run() -> Result<()> {
                 };
                 let rules = ExclusionRules::from_config(&cfg);
                 let live_entries = scan_roots(&live_roots, &rules, &ScanOptions::default()).entries;
-                search(&live_entries, &state, &cfg, home_ref, &query_str, &q_opts)
+                (
+                    None,
+                    None,
+                    search(&live_entries, &state, &cfg, home_ref, &query_str, &q_opts),
+                )
             } else {
                 let cached = if paths.cache_path.exists() {
                     IndexSnapshot::open(&paths.cache_path).ok()
@@ -295,7 +331,11 @@ fn run() -> Result<()> {
                                 &paths.state_path,
                             );
                         }
-                        search_snapshot(&snap, &state, &cfg, home_ref, &query_str, &q_opts)
+                        (
+                            Some(snap.generation),
+                            Some(snap.built_at),
+                            search_snapshot(&snap, &state, &cfg, home_ref, &query_str, &q_opts),
+                        )
                     }
                     _ => {
                         let rules = ExclusionRules::from_config(&cfg);
@@ -304,15 +344,32 @@ fn run() -> Result<()> {
                             &rules,
                             &ScanOptions::default(),
                         );
-                        let _ = publish_index(&paths.cache_path, now, expected_fp, &res.entries);
-                        search(&res.entries, &state, &cfg, home_ref, &query_str, &q_opts)
+                        let next_gen =
+                            publish_index(&paths.cache_path, now, expected_fp, &res.entries).ok();
+                        (
+                            next_gen,
+                            Some(now),
+                            search(&res.entries, &state, &cfg, home_ref, &query_str, &q_opts),
+                        )
                     }
                 }
             };
 
             let stdout = io::stdout();
             let mut out = stdout.lock();
-            if json {
+            if envelope {
+                let env = QueryEnvelope {
+                    schema_version: JSON_SCHEMA_VERSION,
+                    tool: "searxh",
+                    tool_version: env!("CARGO_PKG_VERSION"),
+                    command: "query",
+                    index_generation,
+                    index_built_at,
+                    config_fingerprint: expected_fp,
+                    items: &items,
+                };
+                writeln!(out, "{}", serde_json::to_string_pretty(&env)?)?;
+            } else if json {
                 writeln!(out, "{}", serde_json::to_string_pretty(&items)?)?;
             } else if print0 {
                 for item in &items {
@@ -333,6 +390,7 @@ fn run() -> Result<()> {
 
         Commands::Inspect {
             json,
+            envelope,
             max_bytes,
             max_lines,
             max_entries,
@@ -342,16 +400,25 @@ fn run() -> Result<()> {
             let res = inspect_path(
                 &path,
                 &InspectOptions {
-                    max_bytes,
-                    max_lines,
-                    max_entries,
+                    max_bytes: max_bytes.unwrap_or(cfg.inspect_max_bytes),
+                    max_lines: max_lines.unwrap_or(cfg.inspect_max_lines),
+                    max_entries: max_entries.unwrap_or(cfg.inspect_max_entries),
                     include_gps: gps,
                 },
             )
             .with_context(|| format!("inspect {}", path.display()))?;
             let stdout = io::stdout();
             let mut out = stdout.lock();
-            if json {
+            if envelope {
+                let env = InspectEnvelope {
+                    schema_version: JSON_SCHEMA_VERSION,
+                    tool: "searxh",
+                    tool_version: env!("CARGO_PKG_VERSION"),
+                    command: "inspect",
+                    result: &res,
+                };
+                writeln!(out, "{}", serde_json::to_string_pretty(&env)?)?;
+            } else if json {
                 writeln!(out, "{}", serde_json::to_string_pretty(&res)?)?;
             } else {
                 writeln!(
@@ -359,6 +426,17 @@ fn run() -> Result<()> {
                     "{} ({}, {}, {} bytes, {})",
                     res.path, res.preview_kind, res.category, res.size, res.mode
                 )?;
+                if let Some(mime) = &res.mime {
+                    writeln!(out, "  mime: {mime}")?;
+                }
+                if let Some(target) = &res.symlink_target {
+                    let status = if res.symlink_broken.unwrap_or(false) {
+                        " (broken)"
+                    } else {
+                        ""
+                    };
+                    writeln!(out, "  symlink: -> {target}{status}")?;
+                }
                 if let Some(img) = &res.image {
                     writeln!(
                         out,
