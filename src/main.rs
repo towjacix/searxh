@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use searxh::config::{Config, ExclusionRules, ResolvedPaths, expand_tilde};
-use searxh::index::{IndexSnapshot, now_secs, publish_index, spawn_background_refresh};
+use searxh::index::{
+    IndexSnapshot, IndexWriteLock, now_secs, publish_index_locked, spawn_background_refresh,
+};
 use searxh::inspect::{InspectOptions, inspect_path};
 use searxh::scanner::{ScanOptions, scan_roots};
 use searxh::search::{QueryOptions, QueryOutputItem, TypeFilter, search, search_snapshot};
@@ -80,6 +82,10 @@ enum Commands {
         /// Disable stale-index background refresh
         #[arg(long)]
         no_refresh: bool,
+
+        /// Require a ready index; return status="indexing" instead of blocking on cold scan
+        #[arg(long)]
+        require_index: bool,
 
         /// Override search roots for this query (repeatable)
         #[arg(long = "root")]
@@ -181,6 +187,7 @@ struct QueryEnvelope<'a> {
     tool: &'static str,
     tool_version: &'static str,
     command: &'static str,
+    status: &'static str,
     index_generation: Option<u64>,
     index_built_at: Option<u64>,
     config_fingerprint: u64,
@@ -241,26 +248,31 @@ fn run() -> Result<()> {
                 roots.iter().map(|r| expand_tilde(r, home_ref)).collect()
             };
             let rules = ExclusionRules::from_config(&cfg);
-            let res = scan_roots(
-                &scan_roots_vec,
-                &rules,
-                &ScanOptions {
-                    collect_stat: !no_stat,
-                    ..Default::default()
-                },
-            );
             let fp = if roots.is_empty() {
                 cfg.index_fingerprint(home_ref)
             } else {
                 0
             };
-            let generation = publish_index(&paths.cache_path, now_secs(), fp, &res.entries)?;
+            let (entries_len, watched_dirs_len, generation) = {
+                let _write_lock = IndexWriteLock::acquire(&paths.cache_path)?;
+                let res = scan_roots(
+                    &scan_roots_vec,
+                    &rules,
+                    &ScanOptions {
+                        collect_stat: !no_stat,
+                        ..Default::default()
+                    },
+                );
+                let index_gen =
+                    publish_index_locked(&paths.cache_path, now_secs(), fp, &res.entries)?;
+                (res.entries.len(), res.watched_dirs.len(), index_gen)
+            };
 
             if json {
                 let summary = IndexSummary {
                     cache_path: paths.cache_path.to_string_lossy().into_owned(),
-                    entries: res.entries.len(),
-                    watched_dirs: res.watched_dirs.len(),
+                    entries: entries_len,
+                    watched_dirs: watched_dirs_len,
                     generation,
                     elapsed_ms: started.elapsed().as_millis(),
                 };
@@ -268,8 +280,8 @@ fn run() -> Result<()> {
             } else {
                 println!(
                     "Indexed {} entries ({} dirs) in {}ms -> {}",
-                    res.entries.len(),
-                    res.watched_dirs.len(),
+                    entries_len,
+                    watched_dirs_len,
                     started.elapsed().as_millis(),
                     paths.cache_path.display()
                 );
@@ -284,6 +296,7 @@ fn run() -> Result<()> {
             stat,
             live,
             no_refresh,
+            require_index,
             roots,
             entry_type,
             query,
@@ -300,7 +313,9 @@ fn run() -> Result<()> {
                 now,
             };
 
-            let (index_generation, index_built_at, items) = if live || !roots.is_empty() {
+            let (query_status, index_generation, index_built_at, items) = if live
+                || !roots.is_empty()
+            {
                 let live_roots = if roots.is_empty() {
                     cfg.resolved_roots(home_ref)
                 } else {
@@ -309,6 +324,7 @@ fn run() -> Result<()> {
                 let rules = ExclusionRules::from_config(&cfg);
                 let live_entries = scan_roots(&live_roots, &rules, &ScanOptions::default()).entries;
                 (
+                    "ready",
                     None,
                     None,
                     search(&live_entries, &state, &cfg, home_ref, &query_str, &q_opts),
@@ -332,25 +348,61 @@ fn run() -> Result<()> {
                             );
                         }
                         (
+                            "ready",
                             Some(snap.generation),
                             Some(snap.built_at),
                             search_snapshot(&snap, &state, &cfg, home_ref, &query_str, &q_opts),
                         )
                     }
+                    _ if require_index => {
+                        if !no_refresh {
+                            let _ = spawn_background_refresh(
+                                &paths.config_path,
+                                &paths.cache_path,
+                                &paths.state_path,
+                            );
+                        }
+                        ("indexing", None, None, Vec::new())
+                    }
                     _ => {
-                        let rules = ExclusionRules::from_config(&cfg);
-                        let res = scan_roots(
-                            &cfg.resolved_roots(home_ref),
-                            &rules,
-                            &ScanOptions::default(),
-                        );
-                        let next_gen =
-                            publish_index(&paths.cache_path, now, expected_fp, &res.entries).ok();
-                        (
-                            next_gen,
-                            Some(now),
-                            search(&res.entries, &state, &cfg, home_ref, &query_str, &q_opts),
-                        )
+                        let _write_lock = IndexWriteLock::acquire(&paths.cache_path)?;
+                        // Re-check inside lock: another concurrent rebuild may have published a valid snapshot.
+                        let concurrent = if paths.cache_path.exists() {
+                            IndexSnapshot::open(&paths.cache_path)
+                                .ok()
+                                .filter(|s| s.config_fingerprint == expected_fp)
+                        } else {
+                            None
+                        };
+                        if let Some(snap) = concurrent {
+                            (
+                                "ready",
+                                Some(snap.generation),
+                                Some(snap.built_at),
+                                search_snapshot(&snap, &state, &cfg, home_ref, &query_str, &q_opts),
+                            )
+                        } else {
+                            let rules = ExclusionRules::from_config(&cfg);
+                            let res = scan_roots(
+                                &cfg.resolved_roots(home_ref),
+                                &rules,
+                                &ScanOptions::default(),
+                            );
+                            let built_at = now_secs();
+                            let next_gen = publish_index_locked(
+                                &paths.cache_path,
+                                built_at,
+                                expected_fp,
+                                &res.entries,
+                            )
+                            .ok();
+                            (
+                                "ready",
+                                next_gen,
+                                Some(built_at),
+                                search(&res.entries, &state, &cfg, home_ref, &query_str, &q_opts),
+                            )
+                        }
                     }
                 }
             };
@@ -363,6 +415,7 @@ fn run() -> Result<()> {
                     tool: "searxh",
                     tool_version: env!("CARGO_PKG_VERSION"),
                     command: "query",
+                    status: query_status,
                     index_generation,
                     index_built_at,
                     config_fingerprint: expected_fp,
@@ -502,7 +555,7 @@ fn run() -> Result<()> {
         }
 
         Commands::Watch => {
-            run_watch(&cfg, &paths.cache_path, home_ref)?;
+            run_watch(&paths.config_path, &cfg, &paths.cache_path, home_ref)?;
         }
     }
 

@@ -5,8 +5,10 @@ use crate::search::{basename, format_unix_mode};
 use anyhow::{Context, Result};
 use exif::{In, Reader as ExifReader, Tag, Value as ExifValue};
 use serde::Serialize;
-use std::fs::{self, File};
+use std::fs::{self, File, FileType};
 use std::io::{BufReader, Read};
+#[cfg(unix)]
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
@@ -200,6 +202,33 @@ pub fn inspect_path(path: &Path, opts: &InspectOptions) -> Result<InspectResult>
             name,
             kind: kind.as_str(),
             mime: Some("inode/symlink".to_string()),
+            symlink_target,
+            symlink_broken,
+            resolved_path,
+            category,
+            size,
+            mtime,
+            mode,
+            preview_kind: "none",
+            text: None,
+            encoding: None,
+            truncated: None,
+            lines: None,
+            total_entries: None,
+            dir_summary: None,
+            entries: None,
+            image: None,
+        });
+    }
+
+    let effective_ft = effective_meta.file_type();
+    if !effective_ft.is_file() {
+        // Never open FIFOs, sockets, or device nodes — reading them can block indefinitely.
+        return Ok(InspectResult {
+            path: path_str,
+            name,
+            kind: kind.as_str(),
+            mime: Some(special_file_mime(effective_ft).to_string()),
             symlink_target,
             symlink_broken,
             resolved_path,
@@ -732,4 +761,52 @@ fn parse_gps_coord(exif: &exif::Exif, coord_tag: Tag, ref_tag: Tag, neg_ref: cha
         }
     }
     Some(val)
+}
+
+fn special_file_mime(ft: FileType) -> &'static str {
+    #[cfg(unix)]
+    {
+        if ft.is_fifo() {
+            return "inode/fifo";
+        }
+        if ft.is_char_device() {
+            return "inode/chardevice";
+        }
+        if ft.is_block_device() {
+            return "inode/blockdevice";
+        }
+        if ft.is_socket() {
+            return "inode/socket";
+        }
+    }
+    let _ = ft;
+    "inode/special"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn inspect_skips_fifo_and_symlink_to_fifo_without_blocking() {
+        let tmp = TempDir::new().unwrap();
+        let fifo = tmp.path().join("live_pipe");
+        let status = Command::new("mkfifo").arg(&fifo).status().unwrap();
+        assert!(status.success(), "mkfifo failed");
+
+        let fifo_res = inspect_path(&fifo, &InspectOptions::default()).unwrap();
+        assert_eq!(fifo_res.preview_kind, "none");
+        assert_eq!(fifo_res.mime.as_deref(), Some("inode/fifo"));
+
+        let link = tmp.path().join("pipe_link");
+        std::os::unix::fs::symlink(&fifo, &link).unwrap();
+        let link_res = inspect_path(&link, &InspectOptions::default()).unwrap();
+        assert_eq!(link_res.kind, "symlink");
+        assert_eq!(link_res.symlink_broken, Some(false));
+        assert_eq!(link_res.preview_kind, "none");
+        assert_eq!(link_res.mime.as_deref(), Some("inode/fifo"));
+    }
 }

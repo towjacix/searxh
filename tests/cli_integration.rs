@@ -854,6 +854,114 @@ fn v04_inspector_mime_symlink_dir_summary_and_versioned_envelopes() {
     let q_env: serde_json::Value = serde_json::from_slice(&q_out.stdout).unwrap();
     assert_eq!(q_env["schema_version"], 1);
     assert_eq!(q_env["command"], "query");
+    assert_eq!(q_env["status"], "ready");
     assert!(q_env["index_generation"].as_u64().unwrap() >= 1);
     assert_eq!(q_env["items"][0]["name"], "long_notes.txt");
+}
+
+#[test]
+fn v05_require_index_nonblocking_writer_fencing_and_fifo_guard() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("files");
+    let cfg_path = tmp.path().join("config.toml");
+    let cache_path = tmp.path().join("index.bin");
+    let state_path = tmp.path().join("state.json");
+
+    write_file(&root.join("alpha.txt"), b"hello");
+    write_file(
+        &cfg_path,
+        format!("roots = [{:?}]\n", root.to_string_lossy()).as_bytes(),
+    );
+
+    let bin = env!("CARGO_BIN_EXE_searxh");
+    let base_args = [
+        "--config",
+        cfg_path.to_str().unwrap(),
+        "--cache",
+        cache_path.to_str().unwrap(),
+        "--state",
+        state_path.to_str().unwrap(),
+    ];
+
+    // 1. Cold --require-index with --no-refresh returns status="indexing" without building index.
+    let cold_out = Command::new(bin)
+        .args(base_args)
+        .args([
+            "query",
+            "--envelope",
+            "--require-index",
+            "--no-refresh",
+            "--",
+            "alpha",
+        ])
+        .output()
+        .unwrap();
+    assert!(cold_out.status.success(), "{:?}", cold_out);
+    let cold_env: serde_json::Value = serde_json::from_slice(&cold_out.stdout).unwrap();
+    assert_eq!(cold_env["schema_version"], 1);
+    assert_eq!(cold_env["status"], "indexing");
+    assert_eq!(cold_env["items"].as_array().unwrap().len(), 0);
+    assert!(cold_env["index_generation"].is_null());
+    assert!(!cache_path.exists());
+
+    // 2. Concurrent `searxh index` holds writer lock across scan+publish cleanly.
+    let mut handles = Vec::new();
+    for _ in 0..4 {
+        let bin_s = bin.to_string();
+        let args: Vec<String> = base_args.iter().map(|s| (*s).to_string()).collect();
+        handles.push(thread::spawn(move || {
+            let out = Command::new(&bin_s)
+                .args(&args)
+                .args(["index", "--json"])
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{:?}", out);
+            let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+            v["generation"].as_u64().unwrap()
+        }));
+    }
+    let mut gens: Vec<u64> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    gens.sort_unstable();
+    assert_eq!(gens, vec![1, 2, 3, 4]);
+
+    // 3. Subsequent --require-index returns status="ready" with indexed results.
+    let ready_out = Command::new(bin)
+        .args(base_args)
+        .args([
+            "query",
+            "--envelope",
+            "--require-index",
+            "--no-refresh",
+            "--",
+            "alpha",
+        ])
+        .output()
+        .unwrap();
+    assert!(ready_out.status.success());
+    let ready_env: serde_json::Value = serde_json::from_slice(&ready_out.stdout).unwrap();
+    assert_eq!(ready_env["status"], "ready");
+    assert_eq!(ready_env["index_generation"], 4);
+    assert_eq!(ready_env["items"][0]["name"], "alpha.txt");
+
+    // 4. Special file (FIFO) inspect returns immediately with preview_kind="none".
+    #[cfg(unix)]
+    {
+        let fifo = root.join("blocking_pipe");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let fifo_out = Command::new(bin)
+            .args(base_args)
+            .args(["inspect", "--envelope", "--", fifo.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(fifo_out.status.success());
+        let fifo_env: serde_json::Value = serde_json::from_slice(&fifo_out.stdout).unwrap();
+        assert_eq!(fifo_env["result"]["preview_kind"], "none");
+        assert_eq!(fifo_env["result"]["mime"], "inode/fifo");
+    }
 }

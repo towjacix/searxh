@@ -2,7 +2,8 @@ use searxh::config::Config;
 use searxh::index::{EntryKind, IndexEntry, IndexSnapshot, publish_index};
 use searxh::search::{QueryOptions, TypeFilter, search_snapshot};
 use searxh::state::StateStore;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::Instant;
 use tempfile::TempDir;
 
@@ -113,4 +114,109 @@ fn main() {
             query_ms_total[qi] / iters as f64
         );
     }
+
+    // End-to-end subprocess latency (binary spawn + index open + search/inspect + JSON serialization)
+    if let Some(bin) = find_searxh_binary() {
+        let cfg_path = tmp.path().join("config.toml");
+        let state_path = tmp.path().join("state.json");
+        let inspect_sample = tmp.path().join("sample.rs");
+        std::fs::write(
+            &cfg_path,
+            format!("roots = [{:?}]\n", home.to_string_lossy()),
+        )
+        .unwrap();
+        std::fs::write(&inspect_sample, "fn main() { println!(\"hello\"); }\n").unwrap();
+
+        let cfg_reload = Config::load(&cfg_path).unwrap();
+        let fp = cfg_reload.index_fingerprint(None);
+        publish_index(&cache_path, 1_700_500_000, fp, &entries).unwrap();
+        let state_json = serde_json::to_string(&state).unwrap();
+        std::fs::write(&state_path, state_json).unwrap();
+
+        let base = [
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "--cache",
+            cache_path.to_str().unwrap(),
+            "--state",
+            state_path.to_str().unwrap(),
+        ];
+
+        for q in ["config.toml", "@screenshots", ""] {
+            let label = if q.is_empty() { "<empty>" } else { q };
+            let mut total = 0.0;
+            for _ in 0..iters {
+                let t = Instant::now();
+                let out = Command::new(&bin)
+                    .args(base)
+                    .args(["query", "--envelope", "--no-refresh", "-n", "25", "--", q])
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .output()
+                    .unwrap();
+                assert!(out.status.success());
+                total += t.elapsed().as_secs_f64() * 1000.0;
+            }
+            println!("e2e_query_ms[{label}]={:.2}", total / iters as f64);
+        }
+
+        let cold_cache = tmp.path().join("missing_index.bin");
+        let t_cold = Instant::now();
+        let cold_out = Command::new(&bin)
+            .args([
+                "--config",
+                cfg_path.to_str().unwrap(),
+                "--cache",
+                cold_cache.to_str().unwrap(),
+                "--state",
+                state_path.to_str().unwrap(),
+                "query",
+                "--envelope",
+                "--require-index",
+                "--no-refresh",
+                "--",
+                "config",
+            ])
+            .output()
+            .unwrap();
+        assert!(cold_out.status.success());
+        println!(
+            "e2e_cold_require_index_ms={:.2}",
+            t_cold.elapsed().as_secs_f64() * 1000.0
+        );
+
+        let mut inspect_total = 0.0;
+        for _ in 0..iters {
+            let t = Instant::now();
+            let out = Command::new(&bin)
+                .args(base)
+                .args([
+                    "inspect",
+                    "--envelope",
+                    "--",
+                    inspect_sample.to_str().unwrap(),
+                ])
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            inspect_total += t.elapsed().as_secs_f64() * 1000.0;
+        }
+        println!("e2e_inspect_ms={:.2}", inspect_total / iters as f64);
+    } else {
+        println!("e2e_skipped=missing_binary (build searxh first)");
+    }
+}
+
+fn find_searxh_binary() -> Option<PathBuf> {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        for rel in ["../searxh", "searxh"] {
+            let candidate = dir.join(rel);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
